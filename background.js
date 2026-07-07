@@ -32,16 +32,34 @@ function headerValue(headers, name) {
 
 function classify(details) {
   const path = pathnameOf(details.url);
+  // Many sites (miruro and other aggregators) serve HLS through a proxy, so
+  // the real ".m3u8" sits in a query parameter rather than the path — e.g.
+  // /m3u8-proxy?url=https%3A%2F%2Fcdn%2F...%2Fmaster.m3u8. Decode and scan the
+  // whole URL, but classify by the *path* alone for segment noise so we don't
+  // throw away a playlist proxy whose url= param points at a .ts segment.
+  let fullUrl = details.url;
+  try {
+    fullUrl = decodeURIComponent(details.url);
+  } catch {
+    /* keep raw */
+  }
   const contentType = (headerValue(details.responseHeaders, 'content-type') || '')
     .split(';')[0]
     .trim()
     .toLowerCase();
 
   if (SEGMENT_EXTENSIONS.test(path)) return null;
-  if (PLAYLIST_EXTENSIONS.test(path) || HLS_CONTENT_TYPES.includes(contentType)) {
+  if (
+    PLAYLIST_EXTENSIONS.test(path) ||
+    PLAYLIST_EXTENSIONS.test(fullUrl) ||
+    /[?&/](m3u8|hls)([?&/=.]|$)/i.test(fullUrl) ||
+    HLS_CONTENT_TYPES.includes(contentType)
+  ) {
     return 'hls';
   }
-  if (DIRECT_EXTENSIONS.test(path)) return 'direct';
+  if (DIRECT_EXTENSIONS.test(path) || DIRECT_EXTENSIONS.test(fullUrl.split('?')[0])) {
+    return 'direct';
+  }
   // Media requests with a video content-type but no telling extension
   // (e.g. googlevideo-style URLs).
   if (details.type === 'media' && contentType.startsWith('video/')) return 'direct';

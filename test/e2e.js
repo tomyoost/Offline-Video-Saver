@@ -48,6 +48,25 @@ const server = http.createServer((req, res) => {
     const i = parseInt(u.pathname.match(/\d+/)[0], 10);
     res.setHeader('content-type', 'video/mp2t');
     res.end(segments[i]);
+  } else if (u.pathname === '/proxywatch.html') {
+    // Simulates aggregators (miruro-style) that pull HLS through a proxy where
+    // the real ".m3u8" only appears inside a query parameter, and the proxy
+    // returns a non-HLS content-type so only URL-based detection can catch it.
+    res.setHeader('content-type', 'text/html');
+    res.end(`<title>Proxied Episode 2</title><h1>player</h1>
+      <script>fetch('/proxy?url=' + encodeURIComponent('${'/hi.m3u8'}')).then(r=>r.text());</script>`);
+  } else if (u.pathname === '/proxy') {
+    const target = u.searchParams.get('url');
+    if (/\/hi\.m3u8$/.test(target || '')) {
+      res.setHeader('content-type', 'text/plain'); // deliberately NOT an HLS type
+      let body = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n';
+      for (let i = 0; i < SEG_COUNT; i++) body += `#EXTINF:4.0,\nhi-seg${i}.ts\n`;
+      body += '#EXT-X-ENDLIST\n';
+      res.end(body);
+    } else {
+      res.statusCode = 404;
+      res.end('nope');
+    }
   } else if (u.pathname === '/enc.m3u8') {
     res.setHeader('content-type', 'application/vnd.apple.mpegurl');
     let body =
@@ -212,6 +231,22 @@ const server = http.createServer((req, res) => {
       throw new Error('FAIL: decrypted content wrong');
   }
   console.log('PASS: AES-128 stream decrypted and stitched correctly');
+
+  // 6. Proxy-style detection: the ".m3u8" only exists in a query parameter and
+  // the response is served as text/plain — this is how aggregators like miruro
+  // deliver HLS. Only URL-based detection can catch it.
+  const proxyPage = await ctx.newPage();
+  await proxyPage.goto(base + '/proxywatch.html');
+  await proxyPage.waitForTimeout(1500);
+  const proxyStore = await sw.evaluate(() => chrome.storage.session.get(null));
+  const proxyEntry = Object.entries(proxyStore).find(
+    ([k, v]) => k.startsWith('tab-') && v.some((it) => it.url.includes('/proxy?url='))
+  );
+  if (!proxyEntry) throw new Error('FAIL: proxied m3u8 (query-param) not detected');
+  const proxyItem = proxyEntry[1].find((it) => it.url.includes('/proxy?url='));
+  if (proxyItem.kind !== 'hls')
+    throw new Error('FAIL: proxied stream classified as ' + proxyItem.kind);
+  console.log('PASS: proxy-style m3u8 detected via URL ->', proxyItem.url.slice(0, 70));
 
   console.log('ALL TESTS PASSED');
   await ctx.close();
