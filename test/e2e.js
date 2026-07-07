@@ -15,6 +15,14 @@ function makeSegment(i) {
 }
 const segments = Array.from({ length: SEG_COUNT }, (_, i) => makeSegment(i));
 
+// A real H.264+AAC MPEG-TS clip (generated with ffmpeg) used to exercise the
+// mux.js TS -> MP4 remux path end-to-end. Split into two TS-packet-aligned
+// segments so we also test feeding the transmuxer multiple pushes.
+const fs = require('fs');
+const REAL_TS = fs.readFileSync(path.join(__dirname, 'fixtures', 'real.ts'));
+const REAL_SPLIT = Math.floor(REAL_TS.length / 2 / 188) * 188;
+const REAL_SEGS = [REAL_TS.slice(0, REAL_SPLIT), REAL_TS.slice(REAL_SPLIT)];
+
 const crypto = require('crypto');
 const AES_KEY = crypto.randomBytes(16);
 function encryptSegment(i) {
@@ -67,6 +75,16 @@ const server = http.createServer((req, res) => {
       res.statusCode = 404;
       res.end('nope');
     }
+  } else if (u.pathname === '/real.m3u8') {
+    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+    res.end(
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n' +
+        '#EXTINF:1.0,\nreal-seg0.ts\n#EXTINF:1.0,\nreal-seg1.ts\n#EXT-X-ENDLIST\n'
+    );
+  } else if (/^\/real-seg[01]\.ts$/.test(u.pathname)) {
+    const i = parseInt(u.pathname.match(/[01]/)[0], 10);
+    res.setHeader('content-type', 'video/mp2t');
+    res.end(REAL_SEGS[i]);
   } else if (u.pathname === '/enc.m3u8') {
     res.setHeader('content-type', 'application/vnd.apple.mpegurl');
     let body =
@@ -108,6 +126,13 @@ const server = http.createServer((req, res) => {
   if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 15000 });
   const extId = new URL(sw.url()).host;
   console.log('extension id:', extId);
+
+  // Fail loudly on background errors — e.g. the DNR "does not have a unique ID"
+  // collision this test guards against.
+  const swErrors = [];
+  sw.on('console', (m) => {
+    if (m.type() === 'error') swErrors.push(m.text());
+  });
 
   // 1. Visit the watch page; the m3u8 fetch should be detected.
   const page = await ctx.newPage();
@@ -247,6 +272,55 @@ const server = http.createServer((req, res) => {
   if (proxyItem.kind !== 'hls')
     throw new Error('FAIL: proxied stream classified as ' + proxyItem.kind);
   console.log('PASS: proxy-style m3u8 detected via URL ->', proxyItem.url.slice(0, 70));
+
+  // 7. Real MPEG-TS -> MP4 remux: download an actual H.264/AAC TS stream and
+  // confirm the saved file is a valid MP4 (ftyp + moof/mdat), not raw .ts.
+  const realResp = await popup.evaluate(
+    (item) => chrome.runtime.sendMessage({ type: 'download', item }),
+    { url: base + '/real.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'Real Clip' }
+  );
+  if (!realResp || !realResp.ok) throw new Error('FAIL: real-TS enqueue failed');
+
+  await dlPage.waitForFunction(
+    () => document.querySelectorAll('.job.done, .job.error').length >= 3,
+    { timeout: 30000 }
+  );
+  const realStatus = await dlPage.evaluate(() => ({
+    cls: document.querySelector('.job').className,
+    text: document.querySelector('.job .status').textContent,
+  }));
+  console.log('real-TS job result:', JSON.stringify(realStatus));
+  if (!realStatus.cls.includes('done'))
+    throw new Error('FAIL: real-TS job errored: ' + realStatus.text);
+
+  const realDownload = await dlPage.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const poll = () =>
+          chrome.downloads.search({ orderBy: ['-startTime'] }, (items) => {
+            const it = items[0];
+            if (it && it.state === 'complete') resolve(it);
+            else setTimeout(poll, 300);
+          });
+        poll();
+      })
+  );
+  const mp4 = fs.readFileSync(realDownload.filename);
+  const firstBox = mp4.slice(4, 8).toString('ascii');
+  const hasMoof = mp4.includes(Buffer.from('moof'));
+  const hasMdat = mp4.includes(Buffer.from('mdat'));
+  console.log(
+    'remuxed output:', realDownload.filename.split('/').pop(),
+    'firstBox=' + firstBox, 'moof=' + hasMoof, 'mdat=' + hasMdat, 'size=' + mp4.length
+  );
+  if (firstBox !== 'ftyp') throw new Error('FAIL: remux output is not MP4 (box ' + firstBox + ')');
+  if (!hasMoof || !hasMdat) throw new Error('FAIL: MP4 missing moof/mdat fragments');
+  if (mp4[0] === 0x47) throw new Error('FAIL: output is still raw TS');
+  console.log('PASS: real MPEG-TS remuxed to valid fragmented MP4');
+
+  const idErr = swErrors.find((e) => /unique ID|declarativeNetRequest/i.test(e));
+  if (idErr) throw new Error('FAIL: background DNR error: ' + idErr);
+  console.log('PASS: no background DNR rule-id errors (' + swErrors.length + ' sw errors seen)');
 
   console.log('ALL TESTS PASSED');
   await ctx.close();

@@ -15,7 +15,6 @@ const SEGMENT_EXTENSIONS = /\.(ts|m4s|aac|vtt|srt|key|mpd|jpg|jpeg|png|gif|webp|
 
 // tabId -> Map(url -> item)
 const mediaByTab = new Map();
-let dnrRuleId = 1000;
 
 function pathnameOf(url) {
   try {
@@ -169,11 +168,22 @@ async function addRefererRule(mediaUrl, pageUrl) {
   );
   if (already) return;
 
-  dnrRuleId += 1;
+  // The MV3 service worker can be torn down and restarted at any time, which
+  // resets module state — but session DNR rules persist for the whole browser
+  // session. So never trust an in-memory counter for the id (that caused
+  // "Rule with id N does not have a unique ID"): derive it from the rules that
+  // actually exist right now. Also drop any stale rule for this same host so a
+  // changed Referer replaces it instead of piling up.
+  const removeRuleIds = existing
+    .filter((r) => r.condition.requestDomains && r.condition.requestDomains.includes(mediaHost))
+    .map((r) => r.id);
+  const newId = existing.reduce((max, r) => Math.max(max, r.id), 1000) + 1;
+
   await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds,
     addRules: [
       {
-        id: dnrRuleId,
+        id: newId,
         priority: 1,
         action: { type: 'modifyHeaders', requestHeaders },
         condition: {

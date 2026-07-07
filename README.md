@@ -9,8 +9,10 @@ It handles the two ways sites serve video:
 - **Direct files** (`.mp4`, `.webm`, …) — handed straight to Chrome's downloader.
 - **HLS streams** (`.m3u8`) — the format most streaming/anime sites use. The
   extension fetches every segment, decrypts standard AES-128 encryption when
-  present, picks the highest quality, and stitches everything into a single
-  playable file with a progress bar. You can queue several episodes at once.
+  present, picks the highest-quality **video** track, and stitches everything
+  into a single file with a progress bar. MPEG-TS streams are automatically
+  remuxed to **`.mp4`** so they open in QuickTime and other default players
+  (no more "not compatible" errors). You can queue several episodes at once.
 
 ## Installing
 
@@ -35,11 +37,21 @@ Works the same in Edge, Brave, Opera, and other Chromium browsers.
      time, the rest wait in line).
 4. Files land in your regular Downloads folder, named after the page title.
 
+### Multiple entries for one episode
+
+Some sites expose several streams for the same episode — different servers,
+and often a separate **dubbed** audio track. When that happens the popup lists
+them numbered (`#1`, `#2`, …) and flags dubs/audio tracks it can spot from the
+URL. Pick the one you want; if unsure, grab `#1` (usually the main
+subtitled stream).
+
 ### Playing the files
 
-Streams are saved as `.mp4` or `.ts` depending on the site.
-Both play perfectly in **[VLC](https://www.videolan.org/vlc/)** (free, on
-desktop and mobile). `.mp4` files also play in most default players.
+Streams are normally saved as `.mp4` and play in QuickTime, the Windows
+player, phones, and everywhere else. Occasionally a stream that can't be
+converted is saved as `.ts` instead — those play in
+**[VLC](https://www.videolan.org/vlc/)** (free, desktop and mobile), which is
+a great pick for offline watching anyway.
 
 ## What it can't do
 
@@ -59,19 +71,24 @@ desktop and mobile). `.mp4` files also play in most default players.
   session rules so CDNs that check the referrer accept the segment requests.
 - `popup.*` — the toolbar popup listing detected videos for the current tab.
 - `downloader.*` — the download-manager page; parses the M3U8 playlist
-  (master → best variant → segments), downloads segments 4 at a time with
-  retries, decrypts AES-128 via WebCrypto, and concatenates the result into a
-  single `.ts` (MPEG-TS) or `.mp4` (fMP4) blob saved through
-  `chrome.downloads`.
+  (master → best video variant → segments), downloads segments 4 at a time
+  with retries, decrypts AES-128 via WebCrypto, and remuxes MPEG-TS to
+  fragmented MP4 with the bundled `vendor/mux-mp4.min.js`
+  ([mux.js](https://github.com/videojs/mux.js), Apache-2.0) before saving
+  through `chrome.downloads`. If remuxing yields nothing, it falls back to
+  saving the raw `.ts`.
 
 Everything runs locally in your browser. No servers, no tracking, no accounts.
 
 ## Development
 
-`test/e2e.js` spins up a local HTTP server with a fake HLS stream (master
-playlist, two quality variants, plus an AES-128-encrypted variant), loads the
-extension into Chromium via Playwright, and verifies the whole flow: detection
-→ queue → segment download → decryption → stitched output file. Run it with:
+`test/e2e.js` spins up a local HTTP server with fake HLS streams, loads the
+extension into Chromium via Playwright, and verifies the whole flow end-to-end:
+plain detection + stitching, AES-128 decryption, proxy-style (query-param)
+`.m3u8` detection, and a **real** H.264/AAC MPEG-TS clip
+(`test/fixtures/real.ts`) being remuxed to a valid MP4 — plus a guard that the
+background service worker logs no `declarativeNetRequest` rule-id errors. Run
+it with:
 
 ```sh
 npm i -g playwright   # once, if not installed

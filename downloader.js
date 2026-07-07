@@ -39,6 +39,7 @@ function parseMaster(text, baseUrl) {
           url: new URL(lines[j].trim(), baseUrl).href,
           bandwidth: parseInt(attrs.BANDWIDTH || '0', 10),
           resolution: attrs.RESOLUTION || '',
+          codecs: attrs.CODECS || '',
         });
       }
     }
@@ -167,6 +168,55 @@ function formatSize(bytes) {
   return (bytes / 1e6).toFixed(1) + ' MB';
 }
 
+// --- MPEG-TS -> fragmented MP4 remux (via bundled mux.js) --------------------
+
+// Feeds the collected TS segments through mux.js and returns a single fMP4
+// (Uint8Array), or null if mux.js is unavailable or the stream produces no
+// output (e.g. not really H.264/AAC) so the caller can fall back to raw .ts.
+function transmuxToMp4(parts) {
+  return new Promise((resolve) => {
+    if (typeof muxjs === 'undefined' || !muxjs.Transmuxer) {
+      resolve(null);
+      return;
+    }
+    let init = null;
+    const datas = [];
+    let settled = false;
+    try {
+      const transmuxer = new muxjs.Transmuxer({ keepOriginalTimestamps: true });
+      transmuxer.on('data', (seg) => {
+        if (!init) init = new Uint8Array(seg.initSegment);
+        datas.push(new Uint8Array(seg.data));
+      });
+      transmuxer.on('done', () => {
+        if (settled) return;
+        settled = true;
+        if (!init || !datas.length) {
+          resolve(null);
+          return;
+        }
+        let total = init.length;
+        for (const d of datas) total += d.length;
+        const out = new Uint8Array(total);
+        out.set(init, 0);
+        let off = init.length;
+        for (const d of datas) {
+          out.set(d, off);
+          off += d.length;
+        }
+        resolve(out);
+      });
+      // Feed segments in order; the transmuxer buffers across pushes.
+      for (const part of parts) transmuxer.push(new Uint8Array(part));
+      transmuxer.flush();
+      if (!settled) resolve(null); // flush should have emitted 'done' synchronously
+    } catch (e) {
+      console.error('transmux failed, falling back to .ts', e);
+      resolve(null);
+    }
+  });
+}
+
 // --- Job runner ----------------------------------------------------------------
 
 async function runJob(job) {
@@ -178,14 +228,20 @@ async function runJob(job) {
     if (!res.ok) throw new Error('playlist HTTP ' + res.status);
     let text = await res.text();
 
-    // Master playlist: pick the highest-bandwidth variant.
+    // Master playlist: pick the highest-bandwidth *video* variant. Audio-only
+    // renditions (CODECS without a video codec and no RESOLUTION) would produce
+    // a soundtrack file that won't open as a video, so prefer real video.
     let quality = '';
     if (text.includes('#EXT-X-STREAM-INF:')) {
       const variants = parseMaster(text, playlistUrl);
       if (!variants.length) throw new Error('no variants found in master playlist');
-      variants.sort((a, b) => b.bandwidth - a.bandwidth);
-      playlistUrl = variants[0].url;
-      quality = variants[0].resolution;
+      const hasVideo = (v) =>
+        v.resolution || /avc1|avc3|hev1|hvc1|vp0?9|av01|mp4v/i.test(v.codecs);
+      const videoVariants = variants.filter(hasVideo);
+      const pool = videoVariants.length ? videoVariants : variants;
+      pool.sort((a, b) => b.bandwidth - a.bandwidth);
+      playlistUrl = pool[0].url;
+      quality = pool[0].resolution;
       res = await fetch(playlistUrl);
       if (!res.ok) throw new Error('variant playlist HTTP ' + res.status);
       text = await res.text();
@@ -243,9 +299,28 @@ async function runJob(job) {
     // MPEG-TS segments start with sync byte 0x47; fMP4 segments concatenate
     // into a playable .mp4 when prefixed with the init segment.
     const isTs = first[0] === 0x47;
-    const ext = isTs ? '.ts' : '.mp4';
-    const blobParts = initData ? [initData, ...parts] : parts;
-    const blob = new Blob(blobParts, { type: isTs ? 'video/mp2t' : 'video/mp4' });
+
+    let blob;
+    let ext;
+    if (isTs) {
+      // Raw MPEG-TS won't open in QuickTime or most default players. Remux to
+      // fragmented MP4 (H.264/AAC in an .mp4 container) so files "just work".
+      // If anything about the stream trips up the transmuxer, fall back to
+      // saving the raw .ts — VLC plays that — so we never lose a download.
+      ui.status('Converting to MP4…');
+      const mp4 = await transmuxToMp4(parts);
+      if (mp4) {
+        blob = new Blob([mp4], { type: 'video/mp4' });
+        ext = '.mp4';
+      } else {
+        blob = new Blob(parts, { type: 'video/mp2t' });
+        ext = '.ts';
+      }
+    } else {
+      ext = '.mp4';
+      const blobParts = initData ? [initData, ...parts] : parts;
+      blob = new Blob(blobParts, { type: 'video/mp4' });
+    }
     const objectUrl = URL.createObjectURL(blob);
 
     const downloadId = await chrome.downloads.download({

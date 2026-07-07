@@ -8,11 +8,23 @@ function formatSize(bytes) {
 function shortUrl(url) {
   try {
     const u = new URL(url);
-    const parts = u.pathname.split('/');
-    return u.hostname + '/…/' + parts[parts.length - 1];
+    const parts = u.pathname.split('/').filter(Boolean);
+    const tail = parts.slice(-2).join('/');
+    return u.hostname + '/…/' + (tail || u.pathname);
   } catch {
     return url;
   }
+}
+
+// A site can expose several streams for one episode (different servers, plus a
+// separate dubbed audio track). They often look identical in the list, so pull
+// a hint out of the URL to tell them apart.
+function streamHint(url) {
+  const s = url.toLowerCase();
+  if (/(^|[^a-z])dub([^a-z]|$)|\/dub\b|english/.test(s)) return 'DUB';
+  if (/(^|[^a-z])sub([^a-z]|$)|\/sub\b/.test(s)) return 'SUB';
+  if (/\baudio\b|\/aud\b/.test(s)) return 'AUDIO?';
+  return null;
 }
 
 async function render() {
@@ -28,8 +40,9 @@ async function render() {
   }
 
   empty.hidden = items.length > 0;
+  const multiple = items.length > 1;
 
-  for (const item of items) {
+  items.forEach((item, idx) => {
     const row = document.createElement('div');
     row.className = 'item';
 
@@ -38,8 +51,10 @@ async function render() {
 
     const name = document.createElement('div');
     name.className = 'name';
-    name.textContent = item.title || 'Video';
-    name.title = item.title || '';
+    // Number the entries when a page exposes several look-alike streams.
+    const label = (item.title || 'Video') + (multiple ? '  ·  #' + (idx + 1) : '');
+    name.textContent = label;
+    name.title = item.url;
 
     const meta = document.createElement('div');
     meta.className = 'meta';
@@ -47,6 +62,13 @@ async function render() {
     badge.className = 'badge ' + item.kind;
     badge.textContent = item.kind === 'hls' ? 'STREAM' : 'FILE';
     meta.appendChild(badge);
+    const hint = streamHint(item.url);
+    if (hint) {
+      const hb = document.createElement('span');
+      hb.className = 'badge hint';
+      hb.textContent = hint;
+      meta.appendChild(hb);
+    }
     const size = formatSize(item.size);
     meta.appendChild(
       document.createTextNode((size ? size + ' · ' : '') + shortUrl(item.url))
@@ -73,7 +95,7 @@ async function render() {
     row.appendChild(info);
     row.appendChild(btn);
     list.appendChild(row);
-  }
+  });
 }
 
 document.getElementById('open-downloads').addEventListener('click', (e) => {

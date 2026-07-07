@@ -71,6 +71,7 @@ h1 {
 
 .badge.hls { background: #ede9fe; color: #6d28d9; }
 .badge.direct { background: #dcfce7; color: #15803d; }
+.badge.hint { background: #fef3c7; color: #b45309; }
 
 button.dl {
   border: none;
@@ -102,4 +103,5 @@ button.dl:disabled { background: #93c5fd; cursor: default; }
   .empty { color: #b5bcc9; }
   .badge.hls { background: #3b2a63; color: #c4b5fd; }
   .badge.direct { background: #143c26; color: #86efac; }
+  .badge.hint { background: #4a3410; color: #fcd34d; }
 }
