@@ -126,14 +126,39 @@ function clearTab(tabId) {
   chrome.action.setBadgeText({ tabId, text: '' });
 }
 
-chrome.webNavigation.onCommitted.addListener((details) => {
-  if (details.frameId === 0 && details.transitionType !== 'auto_subframe') {
-    clearTab(details.tabId);
+// Single-page apps (miruro switches episodes via pushState) never fire
+// onCommitted, which left the previous episode's streams in the list — you'd
+// see "Ep 1" while watching Ep 9. Clear on history changes too, but only when
+// the path or query actually changes: players also push state for trivial
+// things (a #hash, a resume-position param) mid-playback.
+const lastUrlByTab = new Map();
+
+function significantPart(url) {
+  try {
+    const u = new URL(url);
+    return u.pathname + u.search;
+  } catch {
+    return url;
   }
+}
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) return;
+  lastUrlByTab.set(details.tabId, significantPart(details.url));
+  if (details.transitionType !== 'auto_subframe') clearTab(details.tabId);
+});
+
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId !== 0) return;
+  const prev = lastUrlByTab.get(details.tabId);
+  const next = significantPart(details.url);
+  lastUrlByTab.set(details.tabId, next);
+  if (prev !== undefined && prev !== next) clearTab(details.tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaByTab.delete(tabId);
+  lastUrlByTab.delete(tabId);
   chrome.storage.session.remove('tab-' + tabId);
 });
 

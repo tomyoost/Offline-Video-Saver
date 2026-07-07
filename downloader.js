@@ -13,6 +13,52 @@ const emptyEl = document.getElementById('empty');
 const seenJobs = new Set();
 let runningJobs = 0;
 const jobQueue = [];
+// URLs currently queued or downloading — a second click on the same stream in
+// the popup would otherwise silently produce "file (1).mp4" duplicates.
+const activeUrls = new Set();
+
+// Per-job pause/cancel control. Cancel aborts in-flight segment fetches via
+// the AbortController; pause is a gate the segment workers wait on.
+function makeJobControl() {
+  const ctl = {
+    paused: false,
+    cancelled: false,
+    started: false,
+    controller: new AbortController(),
+    _resume: null,
+    _waitPromise: null,
+  };
+  ctl.gate = async () => {
+    while (ctl.paused && !ctl.cancelled) {
+      if (!ctl._waitPromise) {
+        ctl._waitPromise = new Promise((r) => {
+          ctl._resume = r;
+        });
+      }
+      await ctl._waitPromise;
+    }
+    if (ctl.cancelled) {
+      const e = new Error('cancelled');
+      e.name = 'AbortError';
+      throw e;
+    }
+  };
+  ctl.pause = () => {
+    ctl.paused = true;
+  };
+  ctl.resume = () => {
+    ctl.paused = false;
+    if (ctl._resume) ctl._resume();
+    ctl._waitPromise = null;
+    ctl._resume = null;
+  };
+  ctl.cancel = () => {
+    ctl.cancelled = true;
+    ctl.controller.abort();
+    ctl.resume(); // release any workers parked on the pause gate
+  };
+  return ctl;
+}
 
 // --- M3U8 parsing ------------------------------------------------------------
 
@@ -127,8 +173,8 @@ function ivFor(segment) {
   return iv;
 }
 
-async function fetchSegment(segment) {
-  const res = await fetch(segment.url);
+async function fetchSegment(segment, signal) {
+  const res = await fetch(segment.url, { signal });
   if (!res.ok) throw new Error('segment HTTP ' + res.status);
   let data = await res.arrayBuffer();
   if (segment.key) {
@@ -149,21 +195,59 @@ async function fetchSegment(segment) {
 
 // --- Job UI -------------------------------------------------------------------
 
-function jobRow(job) {
+function jobRow(job, ctl) {
   const el = document.createElement('div');
   el.className = 'job';
   el.innerHTML =
-    '<div class="top"><div class="name"></div><div class="status">Starting…</div></div>' +
-    '<div class="bar"><div></div></div>';
+    '<div class="top"><div class="name"></div><div class="controls">' +
+    '<button class="ctl pause">Pause</button><button class="ctl cancel">Cancel</button>' +
+    '</div><div class="status">Starting…</div></div>' +
+    '<div class="bar"><div></div></div>' +
+    '<div class="detail" hidden></div>';
   el.querySelector('.name').textContent = job.filename;
   jobsEl.prepend(el);
   emptyEl.hidden = true;
-  return {
-    status(text) { el.querySelector('.status').textContent = text; },
+
+  const pauseBtn = el.querySelector('.pause');
+  const cancelBtn = el.querySelector('.cancel');
+  const statusEl = el.querySelector('.status');
+  let lastStatus = '';
+
+  const ui = {
+    status(text) {
+      lastStatus = text;
+      statusEl.textContent = ctl.paused ? 'Paused — ' + text : text;
+    },
     progress(frac) { el.querySelector('.bar > div').style.width = Math.round(frac * 100) + '%'; },
-    done(text) { el.classList.add('done'); this.status(text); this.progress(1); },
-    error(text) { el.classList.add('error'); this.status(text); },
+    detail(text) {
+      const d = el.querySelector('.detail');
+      d.textContent = text;
+      d.hidden = !text;
+    },
+    finishButtons() { el.querySelector('.controls').remove(); },
+    done(text) { el.classList.add('done'); lastStatus = text; statusEl.textContent = text; this.progress(1); this.finishButtons(); },
+    error(text) { el.classList.add('error'); statusEl.textContent = text; this.finishButtons(); },
+    cancelled() { el.classList.add('cancelled'); statusEl.textContent = 'Cancelled'; this.finishButtons(); },
   };
+
+  pauseBtn.addEventListener('click', () => {
+    if (ctl.paused) {
+      ctl.resume();
+      pauseBtn.textContent = 'Pause';
+      statusEl.textContent = lastStatus;
+    } else {
+      ctl.pause();
+      pauseBtn.textContent = 'Resume';
+      statusEl.textContent = 'Paused — ' + lastStatus;
+    }
+  });
+  cancelBtn.addEventListener('click', () => {
+    ctl.cancel();
+    // A queued job isn't inside runJob yet, so flip its row immediately.
+    if (!ctl.started) ui.cancelled();
+  });
+
+  return ui;
 }
 
 function formatSize(bytes) {
@@ -249,6 +333,7 @@ function remuxToMp4(parts, initData, isTs, onLog) {
     const outName2 = 'out2.mp4';
     let codec = null;
     let resolution = null;
+    let audioCodec = null;
     const onLogLine = (line) => {
       if (!line) return;
       // e.g. "Stream #0:0: Video: hevc (Main), yuv420p(tv), 1920x1080 ..."
@@ -257,6 +342,8 @@ function remuxToMp4(parts, initData, isTs, onLog) {
         codec = m[1];
         resolution = m[2];
       }
+      const a = line.match(/Audio:\s*(\w+)/);
+      if (a && !audioCodec) audioCodec = a[1];
       if (onLog) onLog(line);
     };
 
@@ -294,7 +381,9 @@ function remuxToMp4(parts, initData, isTs, onLog) {
         }
       }
       // Copy out of wasm memory so it survives further use.
-      return out && out.length ? { data: new Uint8Array(out), codec, resolution } : null;
+      return out && out.length
+        ? { data: new Uint8Array(out), codec, resolution, audioCodec }
+        : null;
     } catch (e) {
       console.error('remux failed, falling back to raw save', e);
       try {
@@ -314,12 +403,14 @@ function remuxToMp4(parts, initData, isTs, onLog) {
 
 // --- Job runner ----------------------------------------------------------------
 
-async function runJob(job) {
-  const ui = jobRow(job);
+async function runJob(job, ctl, ui) {
+  ctl.started = true;
+  const signal = ctl.controller.signal;
+  activeUrls.add(job.url);
   try {
     ui.status('Fetching playlist…');
     let playlistUrl = job.url;
-    let res = await fetch(playlistUrl);
+    let res = await fetch(playlistUrl, { signal });
     if (!res.ok) throw new Error('playlist HTTP ' + res.status);
     let text = await res.text();
 
@@ -337,7 +428,7 @@ async function runJob(job) {
       pool.sort((a, b) => b.bandwidth - a.bandwidth);
       playlistUrl = pool[0].url;
       quality = pool[0].resolution;
-      res = await fetch(playlistUrl);
+      res = await fetch(playlistUrl, { signal });
       if (!res.ok) throw new Error('variant playlist HTTP ' + res.status);
       text = await res.text();
     }
@@ -352,7 +443,7 @@ async function runJob(job) {
     let initData = null;
     if (map) {
       ui.status('Fetching init segment…');
-      const initRes = await fetch(map);
+      const initRes = await fetch(map, { signal });
       if (!initRes.ok) throw new Error('init segment HTTP ' + initRes.status);
       initData = await initRes.arrayBuffer();
     }
@@ -363,13 +454,15 @@ async function runJob(job) {
 
     async function worker() {
       while (cursor < segments.length) {
+        await ctl.gate(); // honour pause/cancel between segments
         const idx = cursor++;
         let attempt = 0;
         for (;;) {
           try {
-            parts[idx] = await fetchSegment(segments[idx]);
+            parts[idx] = await fetchSegment(segments[idx], signal);
             break;
           } catch (e) {
+            if (e && e.name === 'AbortError') throw e;
             attempt += 1;
             if (attempt >= 3 || /DRM/.test(String(e))) throw e;
             await new Promise((r) => setTimeout(r, 1000 * attempt));
@@ -436,22 +529,45 @@ async function runJob(job) {
     };
     chrome.downloads.onChanged.addListener(onChanged);
 
+    // Show what's inside, and warn when the codecs are ones QuickTime and
+    // other default players can't handle even in an .mp4 (VP9, Opus, …) —
+    // that combination looks like a "broken" file but plays fine in VLC.
+    if (mp4 && (mp4.codec || mp4.audioCodec)) {
+      const okVideo = !mp4.codec || /^(h264|hevc|mpeg4)$/i.test(mp4.codec);
+      const okAudio = !mp4.audioCodec || /^(aac|mp3|alac)$/i.test(mp4.audioCodec);
+      let detail =
+        (mp4.codec ? 'video: ' + mp4.codec : '') +
+        (mp4.codec && mp4.audioCodec ? ' · ' : '') +
+        (mp4.audioCodec ? 'audio: ' + mp4.audioCodec : '');
+      if (!okVideo || !okAudio) {
+        detail += ' — ⚠ this codec won’t play in QuickTime, use VLC';
+      }
+      ui.detail(detail);
+    }
+
     ui.done(
       'Saved ' + ext + ' — ' + formatSize(blob.size) +
         (quality ? ' · ' + quality : '') +
         (ext === '.ts' ? ' · couldn’t convert, open in VLC' : '')
     );
   } catch (e) {
-    console.error(job, e);
-    ui.error('Failed: ' + (e && e.message ? e.message : e));
+    if ((e && e.name === 'AbortError') || ctl.cancelled) {
+      ui.cancelled();
+    } else {
+      console.error(job, e);
+      ui.error('Failed: ' + (e && e.message ? e.message : e));
+    }
+  } finally {
+    activeUrls.delete(job.url);
   }
 }
 
 async function pump() {
   while (runningJobs < MAX_PARALLEL_JOBS && jobQueue.length) {
-    const job = jobQueue.shift();
+    const entry = jobQueue.shift();
+    if (entry.ctl.cancelled) continue; // cancelled while queued
     runningJobs += 1;
-    runJob(job).finally(() => {
+    runJob(entry.job, entry.ctl, entry.ui).finally(() => {
       runningJobs -= 1;
       pump();
     });
@@ -460,13 +576,18 @@ async function pump() {
 
 async function pickUpJobs() {
   const { jobs = [] } = await chrome.storage.session.get('jobs');
-  const remaining = [];
   for (const job of jobs) {
     if (seenJobs.has(job.id)) continue;
     seenJobs.add(job.id);
-    jobQueue.push(job);
+    // Same stream already queued or downloading (double-click in the popup):
+    // ignore it instead of producing a duplicate "file (1).mp4".
+    if (activeUrls.has(job.url) || jobQueue.some((e) => e.job.url === job.url)) continue;
+    const ctl = makeJobControl();
+    const ui = jobRow(job, ctl);
+    ui.status('Queued…');
+    jobQueue.push({ job, ctl, ui });
   }
-  await chrome.storage.session.set({ jobs: remaining });
+  await chrome.storage.session.set({ jobs: [] });
   pump();
 }
 

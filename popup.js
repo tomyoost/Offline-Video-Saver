@@ -9,8 +9,10 @@ function shortUrl(url) {
   try {
     const u = new URL(url);
     const parts = u.pathname.split('/').filter(Boolean);
-    const tail = parts.slice(-2).join('/');
-    return u.hostname + '/…/' + (tail || u.pathname);
+    const tail = parts.slice(-3).join('/');
+    // The wider popup can afford more of the path — it's often the only thing
+    // that distinguishes look-alike streams.
+    return u.hostname + (parts.length > 3 ? '/…/' : '/') + (tail || '');
   } catch {
     return url;
   }

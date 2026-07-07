@@ -34,10 +34,13 @@ Works the same in Edge, Brave, Opera, and other Chromium browsers.
 3. Hit **Download** next to the one you want.
    - Direct files appear in Chrome's normal download bar.
    - Streams open the **Downloads** tab of the extension, where you'll see
-     per-episode progress. Keep that tab open until they finish. You can go
-     back and queue more episodes while others are downloading (2 run at a
-     time, the rest wait in line).
-4. Files land in your regular Downloads folder, named after the page title.
+     per-episode progress with **Pause/Resume and Cancel** buttons. Keep that
+     tab open until they finish. You can go back and queue more episodes while
+     others are downloading; they run one at a time and the rest wait in line.
+   - After converting, each row shows what's inside (`video: hevc · audio:
+     aac`) and warns if a codec needs VLC.
+4. Files land in your regular Downloads folder, named like
+   `Show Name - Ep 13 #2 (DUB) [1080p].mp4`.
 
 ### Multiple entries for one episode
 

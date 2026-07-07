@@ -88,6 +88,16 @@ const server = http.createServer((req, res) => {
     const i = parseInt(u.pathname.match(/[01]/)[0], 10);
     res.setHeader('content-type', 'video/mp2t');
     res.end(REAL_SEGS[i]);
+  } else if (u.pathname === '/slow.m3u8') {
+    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+    let body = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n';
+    for (let i = 0; i < 10; i++) body += `#EXTINF:4.0,\nslow-seg${i}.ts\n`;
+    body += '#EXT-X-ENDLIST\n';
+    res.end(body);
+  } else if (/^\/slow-seg\d+\.ts$/.test(u.pathname)) {
+    const i = parseInt(u.pathname.match(/\d+/)[0], 10);
+    res.setHeader('content-type', 'video/mp2t');
+    setTimeout(() => res.end(segments[i % SEG_COUNT]), 800);
   } else if (u.pathname === '/hevc.m3u8') {
     res.setHeader('content-type', 'application/vnd.apple.mpegurl');
     res.end(
@@ -365,6 +375,36 @@ const server = http.createServer((req, res) => {
   if (!hevcMoovRegion.includes(Buffer.from('hvc1')))
     throw new Error('FAIL: HEVC not tagged hvc1');
   console.log('PASS: H.265/HEVC MPEG-TS remuxed to standard MP4 with hvc1 tag');
+
+  // 9. Cancel: start a deliberately slow stream, hit its Cancel button, and
+  // confirm the row flips to Cancelled and no new download lands.
+  const downloadsBefore = await dlPage.evaluate(
+    () => new Promise((r) => chrome.downloads.search({}, (i) => r(i.length)))
+  );
+  const slowResp = await popup.evaluate(
+    (it) => chrome.runtime.sendMessage({ type: 'download', item: it }),
+    { url: base + '/slow.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'Slow Clip' }
+  );
+  if (!slowResp || !slowResp.ok) throw new Error('FAIL: slow enqueue failed');
+  await dlPage.waitForFunction(
+    () => {
+      const s = document.querySelector('.job .status');
+      return s && /Downloading|Queued|playlist/i.test(s.textContent);
+    },
+    { timeout: 15000 }
+  );
+  await dlPage.click('.job .ctl.cancel');
+  await dlPage.waitForFunction(
+    () => document.querySelector('.job') && document.querySelector('.job').className.includes('cancelled'),
+    { timeout: 15000 }
+  );
+  await dlPage.waitForTimeout(1500);
+  const downloadsAfter = await dlPage.evaluate(
+    () => new Promise((r) => chrome.downloads.search({}, (i) => r(i.length)))
+  );
+  if (downloadsAfter !== downloadsBefore)
+    throw new Error('FAIL: cancelled job still produced a download');
+  console.log('PASS: cancel stops the job and saves nothing');
 
   const idErr = swErrors.find((e) => /unique ID|declarativeNetRequest/i.test(e));
   if (idErr) throw new Error('FAIL: background DNR error: ' + idErr);
