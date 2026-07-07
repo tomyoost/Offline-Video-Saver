@@ -3,7 +3,10 @@
 // them into one file, and hands it to chrome.downloads.
 
 const SEGMENT_CONCURRENCY = 4;
-const MAX_PARALLEL_JOBS = 2;
+// One episode at a time: the ffmpeg.wasm remux holds a whole file in memory, so
+// running several in parallel risks exhausting the tab's memory on big videos.
+// Segments within a job still download concurrently, and extra episodes queue.
+const MAX_PARALLEL_JOBS = 1;
 
 const jobsEl = document.getElementById('jobs');
 const emptyEl = document.getElementById('empty');
@@ -168,53 +171,93 @@ function formatSize(bytes) {
   return (bytes / 1e6).toFixed(1) + ' MB';
 }
 
-// --- MPEG-TS -> fragmented MP4 remux (via bundled mux.js) --------------------
+// --- Remux to standard MP4 (via bundled ffmpeg.wasm) ------------------------
 
-// Feeds the collected TS segments through mux.js and returns a single fMP4
-// (Uint8Array), or null if mux.js is unavailable or the stream produces no
-// output (e.g. not really H.264/AAC) so the caller can fall back to raw .ts.
-function transmuxToMp4(parts) {
-  return new Promise((resolve) => {
-    if (typeof muxjs === 'undefined' || !muxjs.Transmuxer) {
-      resolve(null);
-      return;
+// ffmpeg.wasm's core is a single shared instance and isn't reentrant, so load
+// it once and run one remux at a time behind a lock.
+let ffmpegCorePromise = null;
+let ffmpegChain = Promise.resolve();
+
+function getFfmpegCore() {
+  if (!ffmpegCorePromise) {
+    if (typeof createFFmpegCore === 'undefined') {
+      ffmpegCorePromise = Promise.resolve(null);
+    } else {
+      ffmpegCorePromise = createFFmpegCore({
+        locateFile: (p) =>
+          p.endsWith('.wasm') ? chrome.runtime.getURL('vendor/ffmpeg-core.wasm') : p,
+      }).catch((e) => {
+        console.error('ffmpeg core failed to load', e);
+        return null;
+      });
     }
-    let init = null;
-    const datas = [];
-    let settled = false;
+  }
+  return ffmpegCorePromise;
+}
+
+// Concatenate the downloaded segments and remux them (stream copy, no
+// re-encode) into a single standard faststart MP4 — the layout QuickTime and
+// other default players want, and it works for any codec (H.264, H.265, …).
+// Returns a Uint8Array, or null so the caller can fall back to a raw save.
+function remuxToMp4(parts, initData, isTs, onLog) {
+  const run = async () => {
+    const core = await getFfmpegCore();
+    if (!core) return null;
+
+    let total = initData ? initData.byteLength : 0;
+    for (const p of parts) total += p.byteLength;
+    const input = new Uint8Array(total);
+    let off = 0;
+    if (initData) {
+      input.set(new Uint8Array(initData), off);
+      off += initData.byteLength;
+    }
+    for (const p of parts) {
+      input.set(new Uint8Array(p), off);
+      off += p.byteLength;
+    }
+
+    const inName = isTs ? 'in.ts' : 'in.mp4';
+    const outName = 'out.mp4';
     try {
-      const transmuxer = new muxjs.Transmuxer({ keepOriginalTimestamps: true });
-      transmuxer.on('data', (seg) => {
-        if (!init) init = new Uint8Array(seg.initSegment);
-        datas.push(new Uint8Array(seg.data));
-      });
-      transmuxer.on('done', () => {
-        if (settled) return;
-        settled = true;
-        if (!init || !datas.length) {
-          resolve(null);
-          return;
+      if (onLog && core.setLogger) core.setLogger((e) => onLog(e && e.message));
+      core.FS.writeFile(inName, input);
+      core.exec('-i', inName, '-c', 'copy', '-movflags', '+faststart', outName);
+      const code = core.ret;
+      let out = null;
+      if (code === 0) {
+        try {
+          out = core.FS.readFile(outName);
+        } catch (_) {
+          out = null;
         }
-        let total = init.length;
-        for (const d of datas) total += d.length;
-        const out = new Uint8Array(total);
-        out.set(init, 0);
-        let off = init.length;
-        for (const d of datas) {
-          out.set(d, off);
-          off += d.length;
+      }
+      // Always clean the in-memory FS so big episodes don't accumulate.
+      for (const f of [inName, outName]) {
+        try {
+          core.FS.unlink(f);
+        } catch (_) {
+          /* not there */
         }
-        resolve(out);
-      });
-      // Feed segments in order; the transmuxer buffers across pushes.
-      for (const part of parts) transmuxer.push(new Uint8Array(part));
-      transmuxer.flush();
-      if (!settled) resolve(null); // flush should have emitted 'done' synchronously
+      }
+      if (core.reset) core.reset();
+      // Copy out of wasm memory so it survives the reset.
+      return out && out.length ? new Uint8Array(out) : null;
     } catch (e) {
-      console.error('transmux failed, falling back to .ts', e);
-      resolve(null);
+      console.error('remux failed, falling back to raw save', e);
+      try {
+        if (core.reset) core.reset();
+      } catch (_) {
+        /* ignore */
+      }
+      return null;
     }
-  });
+  };
+
+  // Serialise ffmpeg usage across concurrent jobs.
+  const result = ffmpegChain.then(run, run);
+  ffmpegChain = result.catch(() => {});
+  return result;
 }
 
 // --- Job runner ----------------------------------------------------------------
@@ -294,32 +337,31 @@ async function runJob(job) {
       Array.from({ length: Math.min(SEGMENT_CONCURRENCY, segments.length) }, worker)
     );
 
-    ui.status('Assembling file…');
+    ui.status('Converting to MP4…');
+    // MPEG-TS segments start with sync byte 0x47; anything else (fMP4 .m4s) is
+    // already an MP4-family stream. Either way, remux to a standard faststart
+    // MP4 so it opens in QuickTime and every other default player, for any
+    // codec. If ffmpeg.wasm isn't available or the remux fails, fall back to a
+    // raw save (.ts plays in VLC) so a download is never lost.
     const first = new Uint8Array(parts[0].slice(0, 4));
-    // MPEG-TS segments start with sync byte 0x47; fMP4 segments concatenate
-    // into a playable .mp4 when prefixed with the init segment.
     const isTs = first[0] === 0x47;
+
+    const mp4 = await remuxToMp4(parts, initData, isTs, (line) => {
+      if (line) ui.status('Converting to MP4… ' + line.slice(0, 60));
+    });
 
     let blob;
     let ext;
-    if (isTs) {
-      // Raw MPEG-TS won't open in QuickTime or most default players. Remux to
-      // fragmented MP4 (H.264/AAC in an .mp4 container) so files "just work".
-      // If anything about the stream trips up the transmuxer, fall back to
-      // saving the raw .ts — VLC plays that — so we never lose a download.
-      ui.status('Converting to MP4…');
-      const mp4 = await transmuxToMp4(parts);
-      if (mp4) {
-        blob = new Blob([mp4], { type: 'video/mp4' });
-        ext = '.mp4';
-      } else {
-        blob = new Blob(parts, { type: 'video/mp2t' });
-        ext = '.ts';
-      }
-    } else {
+    if (mp4) {
+      blob = new Blob([mp4], { type: 'video/mp4' });
       ext = '.mp4';
+    } else if (isTs) {
+      blob = new Blob(parts, { type: 'video/mp2t' });
+      ext = '.ts';
+    } else {
       const blobParts = initData ? [initData, ...parts] : parts;
       blob = new Blob(blobParts, { type: 'video/mp4' });
+      ext = '.mp4';
     }
     const objectUrl = URL.createObjectURL(blob);
 
@@ -337,7 +379,11 @@ async function runJob(job) {
     };
     chrome.downloads.onChanged.addListener(onChanged);
 
-    ui.done('Saved — ' + formatSize(blob.size) + (quality ? ' · ' + quality : ''));
+    ui.done(
+      'Saved ' + ext + ' — ' + formatSize(blob.size) +
+        (quality ? ' · ' + quality : '') +
+        (ext === '.ts' ? ' · couldn’t convert, open in VLC' : '')
+    );
   } catch (e) {
     console.error(job, e);
     ui.error('Failed: ' + (e && e.message ? e.message : e));

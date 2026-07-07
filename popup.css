@@ -51,6 +51,17 @@ h1 {
   text-overflow: ellipsis;
 }
 
+.item .name .num {
+  display: inline-block;
+  color: #2563eb;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .item .name .num { color: #7ab0ff; }
+}
+
 .item .meta {
   color: #6b7280;
   font-size: 11px;

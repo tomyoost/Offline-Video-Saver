@@ -10,9 +10,11 @@ It handles the two ways sites serve video:
 - **HLS streams** (`.m3u8`) — the format most streaming/anime sites use. The
   extension fetches every segment, decrypts standard AES-128 encryption when
   present, picks the highest-quality **video** track, and stitches everything
-  into a single file with a progress bar. MPEG-TS streams are automatically
-  remuxed to **`.mp4`** so they open in QuickTime and other default players
-  (no more "not compatible" errors). You can queue several episodes at once.
+  together with a progress bar. It then repackages the result into a standard
+  **`.mp4`** (using a bundled build of ffmpeg — no re-encoding, so it's fast)
+  so files open in QuickTime and every other default player. This works for
+  any codec, including **H.265/HEVC**, which most anime CDNs use and which
+  simpler downloaders can't convert. You can queue several episodes at once.
 
 ## Installing
 
@@ -49,9 +51,14 @@ subtitled stream).
 
 Streams are normally saved as `.mp4` and play in QuickTime, the Windows
 player, phones, and everywhere else. Occasionally a stream that can't be
-converted is saved as `.ts` instead — those play in
-**[VLC](https://www.videolan.org/vlc/)** (free, desktop and mobile), which is
-a great pick for offline watching anyway.
+repackaged is saved as `.ts` instead (the download manager says so on that
+row) — those play in **[VLC](https://www.videolan.org/vlc/)** (free, desktop
+and mobile), which is a great pick for offline watching anyway.
+
+> The first `.mp4` conversion after opening the Downloads tab loads a ~31 MB
+> converter (bundled, no network) and takes a second or two; after that it's
+> instant. Very large episodes are held in memory while converting, so
+> episodes download and convert one at a time.
 
 ## What it can't do
 
@@ -72,11 +79,13 @@ a great pick for offline watching anyway.
 - `popup.*` — the toolbar popup listing detected videos for the current tab.
 - `downloader.*` — the download-manager page; parses the M3U8 playlist
   (master → best video variant → segments), downloads segments 4 at a time
-  with retries, decrypts AES-128 via WebCrypto, and remuxes MPEG-TS to
-  fragmented MP4 with the bundled `vendor/mux-mp4.min.js`
-  ([mux.js](https://github.com/videojs/mux.js), Apache-2.0) before saving
-  through `chrome.downloads`. If remuxing yields nothing, it falls back to
-  saving the raw `.ts`.
+  with retries, decrypts AES-128 via WebCrypto, then repackages the stream
+  into a standard faststart `.mp4` (stream copy, `-movflags +faststart`) using
+  a bundled build of ffmpeg.wasm (`vendor/ffmpeg-core.{js,wasm}`,
+  [@ffmpeg/core](https://github.com/ffmpegwasm/ffmpeg.wasm)) before saving
+  through `chrome.downloads`. If ffmpeg can't load or fails, it falls back to
+  saving the raw `.ts`. The manifest grants `'wasm-unsafe-eval'` to extension
+  pages so the WebAssembly module can run.
 
 Everything runs locally in your browser. No servers, no tracking, no accounts.
 
@@ -84,9 +93,10 @@ Everything runs locally in your browser. No servers, no tracking, no accounts.
 
 `test/e2e.js` spins up a local HTTP server with fake HLS streams, loads the
 extension into Chromium via Playwright, and verifies the whole flow end-to-end:
-plain detection + stitching, AES-128 decryption, proxy-style (query-param)
-`.m3u8` detection, and a **real** H.264/AAC MPEG-TS clip
-(`test/fixtures/real.ts`) being remuxed to a valid MP4 — plus a guard that the
+detection + stitching, AES-128 decryption, proxy-style (query-param) `.m3u8`
+detection, real **H.264** *and* **H.265/HEVC** MPEG-TS clips
+(`test/fixtures/`) each being remuxed to a standard faststart MP4 (asserts
+`ftyp`/`moov`/`mdat`, `moov` before `mdat`, no `moof`), and a guard that the
 background service worker logs no `declarativeNetRequest` rule-id errors. Run
 it with:
 

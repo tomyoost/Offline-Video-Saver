@@ -51,9 +51,16 @@ async function render() {
 
     const name = document.createElement('div');
     name.className = 'name';
-    // Number the entries when a page exposes several look-alike streams.
-    const label = (item.title || 'Video') + (multiple ? '  ·  #' + (idx + 1) : '');
-    name.textContent = label;
+    // Number the entries when a page exposes several look-alike streams. The
+    // number goes first so it stays visible even when the long title is
+    // truncated with an ellipsis.
+    if (multiple) {
+      const num = document.createElement('span');
+      num.className = 'num';
+      num.textContent = '#' + (idx + 1);
+      name.appendChild(num);
+    }
+    name.appendChild(document.createTextNode(item.title || 'Video'));
     name.title = item.url;
 
     const meta = document.createElement('div');

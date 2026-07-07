@@ -22,6 +22,9 @@ const fs = require('fs');
 const REAL_TS = fs.readFileSync(path.join(__dirname, 'fixtures', 'real.ts'));
 const REAL_SPLIT = Math.floor(REAL_TS.length / 2 / 188) * 188;
 const REAL_SEGS = [REAL_TS.slice(0, REAL_SPLIT), REAL_TS.slice(REAL_SPLIT)];
+// H.265/HEVC clip — mux.js can't touch this; proves the ffmpeg.wasm remux is
+// codec-agnostic (this is the case that broke real downloads).
+const HEVC_TS = fs.readFileSync(path.join(__dirname, 'fixtures', 'hevc.ts'));
 
 const crypto = require('crypto');
 const AES_KEY = crypto.randomBytes(16);
@@ -85,6 +88,15 @@ const server = http.createServer((req, res) => {
     const i = parseInt(u.pathname.match(/[01]/)[0], 10);
     res.setHeader('content-type', 'video/mp2t');
     res.end(REAL_SEGS[i]);
+  } else if (u.pathname === '/hevc.m3u8') {
+    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+    res.end(
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n' +
+        '#EXTINF:2.0,\nhevc-seg0.ts\n#EXT-X-ENDLIST\n'
+    );
+  } else if (u.pathname === '/hevc-seg0.ts') {
+    res.setHeader('content-type', 'video/mp2t');
+    res.end(HEVC_TS);
   } else if (u.pathname === '/enc.m3u8') {
     res.setHeader('content-type', 'application/vnd.apple.mpegurl');
     let body =
@@ -134,18 +146,19 @@ const server = http.createServer((req, res) => {
     if (m.type() === 'error') swErrors.push(m.text());
   });
 
-  // 1. Visit the watch page; the m3u8 fetch should be detected.
+  // 1. Visit the watch page; the m3u8 fetch should be detected. Poll for it —
+  // the first detection can lag while the big extension finishes loading.
   const page = await ctx.newPage();
   await page.goto(base + '/watch.html');
-  await page.waitForTimeout(1500);
 
-  const detected = await sw.evaluate(async () => {
-    const all = await chrome.storage.session.get(null);
-    return all;
-  });
+  let detected = {};
+  let tabEntry = null;
+  for (let i = 0; i < 20 && !tabEntry; i++) {
+    await page.waitForTimeout(500);
+    detected = await sw.evaluate(async () => chrome.storage.session.get(null));
+    tabEntry = Object.entries(detected).find(([k]) => k.startsWith('tab-'));
+  }
   console.log('session storage:', JSON.stringify(detected));
-
-  const tabEntry = Object.entries(detected).find(([k]) => k.startsWith('tab-'));
   if (!tabEntry) throw new Error('FAIL: no video detected');
   const item = tabEntry[1][0];
   if (item.kind !== 'hls') throw new Error('FAIL: expected hls, got ' + item.kind);
@@ -273,50 +286,74 @@ const server = http.createServer((req, res) => {
     throw new Error('FAIL: proxied stream classified as ' + proxyItem.kind);
   console.log('PASS: proxy-style m3u8 detected via URL ->', proxyItem.url.slice(0, 70));
 
-  // 7. Real MPEG-TS -> MP4 remux: download an actual H.264/AAC TS stream and
-  // confirm the saved file is a valid MP4 (ftyp + moof/mdat), not raw .ts.
-  const realResp = await popup.evaluate(
-    (item) => chrome.runtime.sendMessage({ type: 'download', item }),
-    { url: base + '/real.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'Real Clip' }
-  );
-  if (!realResp || !realResp.ok) throw new Error('FAIL: real-TS enqueue failed');
+  // Helpers for the remux jobs (ffmpeg.wasm loads the ~31 MB core the first
+  // time, so give these generous timeouts).
+  async function runRemuxJob(item, doneCount, label) {
+    const resp = await popup.evaluate(
+      (it) => chrome.runtime.sendMessage({ type: 'download', item: it }),
+      item
+    );
+    if (!resp || !resp.ok) throw new Error('FAIL: ' + label + ' enqueue failed');
+    await dlPage.waitForFunction(
+      (n) => document.querySelectorAll('.job.done, .job.error').length >= n,
+      doneCount,
+      { timeout: 90000 }
+    );
+    const status = await dlPage.evaluate(() => ({
+      cls: document.querySelector('.job').className,
+      text: document.querySelector('.job .status').textContent,
+    }));
+    console.log(label + ' job result:', JSON.stringify(status));
+    if (!status.cls.includes('done')) throw new Error('FAIL: ' + label + ' errored: ' + status.text);
+    const dl = await dlPage.evaluate(
+      () =>
+        new Promise((resolve) => {
+          const poll = () =>
+            chrome.downloads.search({ orderBy: ['-startTime'] }, (items) => {
+              const it = items[0];
+              if (it && it.state === 'complete') resolve(it);
+              else setTimeout(poll, 300);
+            });
+          poll();
+        })
+    );
+    return fs.readFileSync(dl.filename);
+  }
 
-  await dlPage.waitForFunction(
-    () => document.querySelectorAll('.job.done, .job.error').length >= 3,
-    { timeout: 30000 }
-  );
-  const realStatus = await dlPage.evaluate(() => ({
-    cls: document.querySelector('.job').className,
-    text: document.querySelector('.job .status').textContent,
-  }));
-  console.log('real-TS job result:', JSON.stringify(realStatus));
-  if (!realStatus.cls.includes('done'))
-    throw new Error('FAIL: real-TS job errored: ' + realStatus.text);
+  function assertStandardMp4(buf, label) {
+    const firstBox = buf.slice(4, 8).toString('ascii');
+    const moov = buf.indexOf(Buffer.from('moov'));
+    const mdat = buf.indexOf(Buffer.from('mdat'));
+    const moof = buf.indexOf(Buffer.from('moof'));
+    console.log(
+      label + ' output: firstBox=' + firstBox,
+      'moov=' + moov, 'mdat=' + mdat, 'moof=' + moof, 'size=' + buf.length
+    );
+    if (buf[0] === 0x47) throw new Error('FAIL: ' + label + ' is still raw TS');
+    if (firstBox !== 'ftyp') throw new Error('FAIL: ' + label + ' not MP4 (box ' + firstBox + ')');
+    if (moov < 0 || mdat < 0) throw new Error('FAIL: ' + label + ' missing moov/mdat');
+    if (moof >= 0) throw new Error('FAIL: ' + label + ' is fragmented (has moof)');
+    if (moov > mdat) throw new Error('FAIL: ' + label + ' not faststart (moov after mdat)');
+  }
 
-  const realDownload = await dlPage.evaluate(
-    () =>
-      new Promise((resolve) => {
-        const poll = () =>
-          chrome.downloads.search({ orderBy: ['-startTime'] }, (items) => {
-            const it = items[0];
-            if (it && it.state === 'complete') resolve(it);
-            else setTimeout(poll, 300);
-          });
-        poll();
-      })
+  // 7. Real H.264/AAC MPEG-TS -> standard faststart MP4 via ffmpeg.wasm.
+  const realMp4 = await runRemuxJob(
+    { url: base + '/real.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'Real Clip' },
+    3,
+    'real-TS(H.264)'
   );
-  const mp4 = fs.readFileSync(realDownload.filename);
-  const firstBox = mp4.slice(4, 8).toString('ascii');
-  const hasMoof = mp4.includes(Buffer.from('moof'));
-  const hasMdat = mp4.includes(Buffer.from('mdat'));
-  console.log(
-    'remuxed output:', realDownload.filename.split('/').pop(),
-    'firstBox=' + firstBox, 'moof=' + hasMoof, 'mdat=' + hasMdat, 'size=' + mp4.length
+  assertStandardMp4(realMp4, 'real-TS(H.264)');
+  console.log('PASS: H.264 MPEG-TS remuxed to standard faststart MP4');
+
+  // 8. H.265/HEVC MPEG-TS -> MP4. mux.js could never do this; proves the remux
+  // is codec-agnostic (this is what broke real downloads).
+  const hevcMp4 = await runRemuxJob(
+    { url: base + '/hevc.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'HEVC Clip' },
+    4,
+    'HEVC'
   );
-  if (firstBox !== 'ftyp') throw new Error('FAIL: remux output is not MP4 (box ' + firstBox + ')');
-  if (!hasMoof || !hasMdat) throw new Error('FAIL: MP4 missing moof/mdat fragments');
-  if (mp4[0] === 0x47) throw new Error('FAIL: output is still raw TS');
-  console.log('PASS: real MPEG-TS remuxed to valid fragmented MP4');
+  assertStandardMp4(hevcMp4, 'HEVC');
+  console.log('PASS: H.265/HEVC MPEG-TS remuxed to standard MP4');
 
   const idErr = swErrors.find((e) => /unique ID|declarativeNetRequest/i.test(e));
   if (idErr) throw new Error('FAIL: background DNR error: ' + idErr);

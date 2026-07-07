@@ -1,0 +1,2 @@
+*.wasm binary
+test/fixtures/*.ts binary
