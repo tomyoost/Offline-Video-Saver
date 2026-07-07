@@ -39,6 +39,9 @@ Works the same in Edge, Brave, Opera, and other Chromium browsers.
      others are downloading; they run one at a time and the rest wait in line.
    - After converting, each row shows what's inside (`video: hevc · audio:
      aac`) and warns if a codec needs VLC.
+   - Every row has a **Details** button with the full technical log and a
+     Copy button — if a file won't play, copy that log when reporting the
+     problem. Rows that fail or can't be converted open it automatically.
 4. Files land in your regular Downloads folder, named like
    `Show Name - Ep 13 #2 (DUB) [1080p].mp4`.
 
@@ -68,6 +71,10 @@ and mobile), which is a great pick for offline watching anyway.
 - **DRM-protected services** (Netflix, Crunchyroll, Disney+, …) encrypt video
   with Widevine DRM. This extension does not and will not bypass DRM — those
   services have their own official offline/download features.
+- **YouTube** is deliberately not supported: it serves video and audio as
+  separate throttled streams with rotating signed URLs, actively fights
+  downloaders, and its terms prohibit it. YouTube Premium has official
+  offline downloads.
 - **Live streams** can't be saved, only finished videos.
 - If a site plays video but nothing is detected, the player may load the
   stream in an unusual way — open an issue with the site and it can likely be

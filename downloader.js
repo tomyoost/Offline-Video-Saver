@@ -200,10 +200,15 @@ function jobRow(job, ctl) {
   el.className = 'job';
   el.innerHTML =
     '<div class="top"><div class="name"></div><div class="controls">' +
+    '<button class="ctl toggle-log">Details</button>' +
     '<button class="ctl pause">Pause</button><button class="ctl cancel">Cancel</button>' +
     '</div><div class="status">Starting…</div></div>' +
     '<div class="bar"><div></div></div>' +
-    '<div class="detail" hidden></div>';
+    '<div class="detail" hidden></div>' +
+    '<div class="logbox" hidden>' +
+    '<div class="logbar"><span>Technical log — copy this when reporting a problem</span>' +
+    '<button class="ctl copy-log">Copy</button></div>' +
+    '<pre class="log"></pre></div>';
   el.querySelector('.name').textContent = job.filename;
   jobsEl.prepend(el);
   emptyEl.hidden = true;
@@ -211,7 +216,19 @@ function jobRow(job, ctl) {
   const pauseBtn = el.querySelector('.pause');
   const cancelBtn = el.querySelector('.cancel');
   const statusEl = el.querySelector('.status');
+  const logBox = el.querySelector('.logbox');
+  const logPre = el.querySelector('.log');
   let lastStatus = '';
+
+  el.querySelector('.toggle-log').addEventListener('click', () => {
+    logBox.hidden = !logBox.hidden;
+  });
+  el.querySelector('.copy-log').addEventListener('click', (ev) => {
+    navigator.clipboard.writeText(logPre.textContent).then(() => {
+      ev.target.textContent = 'Copied ✓';
+      setTimeout(() => (ev.target.textContent = 'Copy'), 1500);
+    });
+  });
 
   const ui = {
     status(text) {
@@ -224,7 +241,9 @@ function jobRow(job, ctl) {
       d.textContent = text;
       d.hidden = !text;
     },
-    finishButtons() { el.querySelector('.controls').remove(); },
+    log(text) { logPre.textContent = text; },
+    showLog() { logBox.hidden = false; },
+    finishButtons() { pauseBtn.remove(); cancelBtn.remove(); },
     done(text) { el.classList.add('done'); lastStatus = text; statusEl.textContent = text; this.progress(1); this.finishButtons(); },
     error(text) { el.classList.add('error'); statusEl.textContent = text; this.finishButtons(); },
     cancelled() { el.classList.add('cancelled'); statusEl.textContent = 'Cancelled'; this.finishButtons(); },
@@ -313,7 +332,10 @@ function hasHev1Tag(buf) {
 function remuxToMp4(parts, initData, isTs, onLog) {
   const run = async () => {
     const core = await getFfmpegCore();
-    if (!core) return null;
+    if (!core) {
+      if (onLog) onLog('[run] ffmpeg core not available — cannot convert');
+      return null;
+    }
 
     let total = initData ? initData.byteLength : 0;
     for (const p of parts) total += p.byteLength;
@@ -348,13 +370,16 @@ function remuxToMp4(parts, initData, isTs, onLog) {
     };
 
     const execOnce = (...args) => {
+      onLogLine('[run] ffmpeg ' + args.join(' '));
       core.exec(...args);
       const code = core.ret;
       if (core.reset) core.reset();
+      onLogLine('[run] ffmpeg exit code: ' + code);
       if (code !== 0) return null;
       try {
         return core.FS.readFile(args[args.length - 1]);
-      } catch (_) {
+      } catch (e) {
+        onLogLine('[run] could not read output file: ' + e);
         return null;
       }
     };
@@ -385,7 +410,7 @@ function remuxToMp4(parts, initData, isTs, onLog) {
         ? { data: new Uint8Array(out), codec, resolution, audioCodec }
         : null;
     } catch (e) {
-      console.error('remux failed, falling back to raw save', e);
+      onLogLine('[run] remux threw: ' + (e && e.stack ? e.stack : e));
       try {
         if (core.reset) core.reset();
       } catch (_) {
@@ -407,6 +432,23 @@ async function runJob(job, ctl, ui) {
   ctl.started = true;
   const signal = ctl.controller.signal;
   activeUrls.add(job.url);
+
+  // Everything of interest lands in this log; the row's Details button shows
+  // it with a Copy button, so problems can be reported without devtools.
+  const logLines = [
+    'Offline Video Saver v' + chrome.runtime.getManifest().version,
+    'date: ' + new Date().toISOString(),
+    'stream: ' + job.url,
+    'page: ' + (job.pageUrl || '(unknown)'),
+  ];
+  const MAX_LOG = 250;
+  const log = (line) => {
+    if (!line) return;
+    logLines.push(String(line));
+    if (logLines.length > MAX_LOG) logLines.splice(4, logLines.length - MAX_LOG);
+    ui.log(logLines.join('\n'));
+  };
+
   try {
     ui.status('Fetching playlist…');
     let playlistUrl = job.url;
@@ -428,12 +470,21 @@ async function runJob(job, ctl, ui) {
       pool.sort((a, b) => b.bandwidth - a.bandwidth);
       playlistUrl = pool[0].url;
       quality = pool[0].resolution;
+      log(
+        'master playlist: ' + variants.length + ' variants, picked ' +
+          (pool[0].resolution || '?') + ' @ ' + pool[0].bandwidth + ' bps'
+      );
       res = await fetch(playlistUrl, { signal });
       if (!res.ok) throw new Error('variant playlist HTTP ' + res.status);
       text = await res.text();
     }
 
     const { segments, map, live } = parseMediaPlaylist(text, playlistUrl);
+    log(
+      'media playlist: ' + segments.length + ' segments' +
+        (map ? ', has init segment (fMP4)' : '') +
+        (segments[0] && segments[0].key ? ', encrypted (' + segments[0].key.method + ')' : '')
+    );
     if (!segments.length) throw new Error('no segments found — is the video playing?');
     if (live) {
       throw new Error('this looks like a live stream; only finished videos can be saved');
@@ -490,24 +541,33 @@ async function runJob(job, ctl, ui) {
     // raw save (.ts plays in VLC) so a download is never lost.
     const first = new Uint8Array(parts[0].slice(0, 4));
     const isTs = first[0] === 0x47;
+    log('container: ' + (isTs ? 'MPEG-TS' : 'fMP4/other') + ', downloaded ' + formatSize(totalBytes));
 
     const mp4 = await remuxToMp4(parts, initData, isTs, (line) => {
-      if (line) ui.status('Converting to MP4… ' + line.slice(0, 60));
+      log(line);
+      if (line && !line.startsWith('[run]')) {
+        ui.status('Converting to MP4… ' + line.slice(0, 60));
+      }
     });
 
     let blob;
     let ext;
+    let converted = false;
     if (mp4) {
       blob = new Blob([mp4.data], { type: 'video/mp4' });
       ext = '.mp4';
+      converted = true;
       if (!quality && mp4.resolution) quality = mp4.resolution;
+      log('conversion OK: ' + formatSize(mp4.data.length));
     } else if (isTs) {
       blob = new Blob(parts, { type: 'video/mp2t' });
       ext = '.ts';
+      log('conversion FAILED — saving raw MPEG-TS (.ts); plays in VLC');
     } else {
       const blobParts = initData ? [initData, ...parts] : parts;
       blob = new Blob(blobParts, { type: 'video/mp4' });
       ext = '.mp4';
+      log('conversion FAILED — saving raw fMP4 concat; may not play in QuickTime, use VLC');
     }
     const objectUrl = URL.createObjectURL(blob);
 
@@ -545,17 +605,25 @@ async function runJob(job, ctl, ui) {
       ui.detail(detail);
     }
 
-    ui.done(
-      'Saved ' + ext + ' — ' + formatSize(blob.size) +
-        (quality ? ' · ' + quality : '') +
-        (ext === '.ts' ? ' · couldn’t convert, open in VLC' : '')
-    );
+    if (converted) {
+      ui.done('Saved ' + ext + ' — ' + formatSize(blob.size) + (quality ? ' · ' + quality : ''));
+    } else {
+      // Be loud about unconverted saves: the file has a video extension but
+      // default players may refuse it. The log explains why it failed.
+      ui.done(
+        'Saved ' + ext + ' (NOT converted) — ' + formatSize(blob.size) +
+          ' · ⚠ may not play in QuickTime, use VLC — see Details'
+      );
+      ui.showLog();
+    }
   } catch (e) {
     if ((e && e.name === 'AbortError') || ctl.cancelled) {
       ui.cancelled();
     } else {
       console.error(job, e);
-      ui.error('Failed: ' + (e && e.message ? e.message : e));
+      log('FATAL: ' + (e && e.stack ? e.stack : e));
+      ui.error('Failed: ' + (e && e.message ? e.message : e) + ' — see Details');
+      ui.showLog();
     }
   } finally {
     activeUrls.delete(job.url);

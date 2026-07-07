@@ -71,6 +71,35 @@ button.ctl.cancel { color: #dc2626; border-color: #fca5a5; }
 
 .job .detail:empty { display: none; }
 
+.logbox {
+  margin-top: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.logbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #6b7280;
+  background: #f3f4f6;
+}
+
+pre.log {
+  margin: 0;
+  padding: 10px;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .bar {
   margin-top: 10px;
   height: 8px;
@@ -106,4 +135,6 @@ button.ctl.cancel { color: #dc2626; border-color: #fca5a5; }
   button.ctl { border-color: #3a4150; }
   button.ctl.cancel { color: #f87171; border-color: #7f1d1d; }
   .job.cancelled .status { color: #fbbf24; }
+  .logbox { border-color: #262b34; }
+  .logbar { background: #14171c; color: #9aa2b1; }
 }

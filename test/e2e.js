@@ -203,6 +203,27 @@ const server = http.createServer((req, res) => {
     throw new Error('FAIL: filename missing episode tag: ' + status.name);
   console.log('PASS: filename carries episode number ->', status.name);
 
+  // This synthetic stream can't be converted, so the row must say so loudly
+  // and auto-open a copyable technical log that explains why.
+  const logInfo = await dlPage.evaluate(() => {
+    const row = document.querySelector('.job');
+    const box = row.querySelector('.logbox');
+    return {
+      visible: box && !box.hidden,
+      text: row.querySelector('pre.log').textContent,
+      hasCopy: !!row.querySelector('.copy-log'),
+    };
+  });
+  if (!status.text.includes('NOT converted'))
+    throw new Error('FAIL: unconverted save not flagged: ' + status.text);
+  if (!logInfo.visible) throw new Error('FAIL: log not auto-shown on conversion failure');
+  if (!logInfo.hasCopy) throw new Error('FAIL: no copy button in log');
+  for (const marker of ['Offline Video Saver v', 'stream:', 'ffmpeg', 'conversion FAILED']) {
+    if (!logInfo.text.includes(marker))
+      throw new Error('FAIL: log missing "' + marker + '"; log was:\n' + logInfo.text.slice(0, 600));
+  }
+  console.log('PASS: failure log auto-shown, copyable, and explains the fallback');
+
   // 4. Verify the chrome.downloads entry: right size, complete, .ts name.
   const download = await dlPage.evaluate(
     () =>
