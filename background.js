@@ -203,6 +203,50 @@ function sanitizeFilename(name) {
     .slice(0, 120) || 'video';
 }
 
+// Page titles tend to be noisy ("Watch <show> · <site>"); keep just the show.
+function cleanTitle(title) {
+  let t = (title || '').replace(/^watch\s+/i, '');
+  const dot = t.split('·')[0].trim();
+  if (dot) t = dot;
+  return t.trim() || title || 'video';
+}
+
+// Pull the episode number out of the page URL (?ep=13, ?episode=13, /episode-13).
+function episodeFrom(pageUrl) {
+  try {
+    const u = new URL(pageUrl);
+    const q = u.searchParams.get('ep') || u.searchParams.get('episode');
+    if (q && /^\d{1,4}$/.test(q)) return q;
+    const m = u.pathname.match(/ep(?:isode)?[-_/]?(\d{1,4})(?:[^\d]|$)/i);
+    if (m) return m[1];
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+// Same heuristic as the popup badge: spot dub/sub tracks from the stream URL.
+function streamHint(url) {
+  const s = (url || '').toLowerCase();
+  if (/(^|[^a-z])dub([^a-z]|$)|\/dub\b|english/.test(s)) return 'DUB';
+  if (/(^|[^a-z])sub([^a-z]|$)|\/sub\b/.test(s)) return 'SUB';
+  return null;
+}
+
+// "Let This Grieving Soul Retire - Ep 13 #2 (DUB)" instead of five identical
+// "Watch … · Miruro" files.
+function buildFilename(item, streamIndex) {
+  let name = cleanTitle(item.title);
+  const ep = episodeFrom(item.pageUrl);
+  if (ep && !new RegExp('\\b(ep|episode)\\s*\\.?\\s*' + ep + '\\b', 'i').test(name)) {
+    name += ' - Ep ' + ep;
+  }
+  if (streamIndex) name += ' #' + streamIndex;
+  const hint = streamHint(item.url);
+  if (hint) name += ' (' + hint + ')';
+  return sanitizeFilename(name);
+}
+
 async function ensureDownloaderTab() {
   const url = chrome.runtime.getURL('downloader.html');
   const tabs = await chrome.tabs.query({ url });
@@ -212,14 +256,14 @@ async function ensureDownloaderTab() {
   return chrome.tabs.create({ url, active: false });
 }
 
-async function enqueueJob(item) {
+async function enqueueJob(item, streamIndex) {
   const { jobs = [] } = await chrome.storage.session.get('jobs');
   const job = {
     id: 'job-' + Date.now() + '-' + Math.floor(Math.random() * 1e6),
     url: item.url,
     kind: item.kind,
     pageUrl: item.pageUrl,
-    filename: sanitizeFilename(item.title),
+    filename: buildFilename(item, streamIndex),
     addedAt: Date.now(),
   };
   jobs.push(job);
@@ -240,14 +284,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           await chrome.downloads.download({
             url: item.url,
-            filename: sanitizeFilename(item.title) + ext,
+            filename: buildFilename(item, msg.streamIndex) + ext,
           });
           sendResponse({ ok: true, mode: 'browser' });
         } catch (e) {
           sendResponse({ ok: false, error: String(e) });
         }
       } else {
-        await enqueueJob(item);
+        await enqueueJob(item, msg.streamIndex);
         sendResponse({ ok: true, mode: 'queued' });
       }
     })();

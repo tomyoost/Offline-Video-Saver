@@ -149,7 +149,7 @@ const server = http.createServer((req, res) => {
   // 1. Visit the watch page; the m3u8 fetch should be detected. Poll for it —
   // the first detection can lag while the big extension finishes loading.
   const page = await ctx.newPage();
-  await page.goto(base + '/watch.html');
+  await page.goto(base + '/watch.html?ep=9'); // ?ep drives the "Ep 9" filename tag
 
   let detected = {};
   let tabEntry = null;
@@ -189,6 +189,9 @@ const server = http.createServer((req, res) => {
   }));
   console.log('job result:', JSON.stringify(status));
   if (!status.cls.includes('done')) throw new Error('FAIL: job errored: ' + status.text);
+  if (!/Ep 9/.test(status.name))
+    throw new Error('FAIL: filename missing episode tag: ' + status.name);
+  console.log('PASS: filename carries episode number ->', status.name);
 
   // 4. Verify the chrome.downloads entry: right size, complete, .ts name.
   const download = await dlPage.evaluate(
@@ -353,7 +356,15 @@ const server = http.createServer((req, res) => {
     'HEVC'
   );
   assertStandardMp4(hevcMp4, 'HEVC');
-  console.log('PASS: H.265/HEVC MPEG-TS remuxed to standard MP4');
+  // Apple players only accept HEVC tagged 'hvc1'; 'hev1' shows up as
+  // "not compatible" in QuickTime even though the video data is identical.
+  const hevcMdat = hevcMp4.indexOf(Buffer.from('mdat'));
+  const hevcMoovRegion = hevcMp4.slice(0, hevcMdat > 0 ? hevcMdat : 4096);
+  if (hevcMoovRegion.includes(Buffer.from('hev1')))
+    throw new Error('FAIL: HEVC still tagged hev1 (QuickTime-incompatible)');
+  if (!hevcMoovRegion.includes(Buffer.from('hvc1')))
+    throw new Error('FAIL: HEVC not tagged hvc1');
+  console.log('PASS: H.265/HEVC MPEG-TS remuxed to standard MP4 with hvc1 tag');
 
   const idErr = swErrors.find((e) => /unique ID|declarativeNetRequest/i.test(e));
   if (idErr) throw new Error('FAIL: background DNR error: ' + idErr);

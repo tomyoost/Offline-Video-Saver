@@ -90,7 +90,12 @@ async function render() {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       btn.textContent = '…';
-      const res = await chrome.runtime.sendMessage({ type: 'download', item });
+      const res = await chrome.runtime.sendMessage({
+        type: 'download',
+        item,
+        // Only number the file when there are look-alike streams to tell apart.
+        streamIndex: multiple ? idx + 1 : null,
+      });
       if (res && res.ok) {
         btn.textContent = res.mode === 'queued' ? 'Queued ✓' : 'Saving ✓';
       } else {

@@ -195,10 +195,37 @@ function getFfmpegCore() {
   return ffmpegCorePromise;
 }
 
+// Does this MP4 tag its HEVC video as 'hev1'? Apple players (QuickTime,
+// Safari, iOS) only accept the 'hvc1' tag — identical video, different label —
+// so 'hev1' files show up as "not compatible". Only scan up to the mdat box:
+// the moov (with the codec tag) sits before it thanks to faststart, and the
+// media payload after it could contain the byte sequence by chance.
+function hasHev1Tag(buf) {
+  const needle = [0x68, 0x65, 0x76, 0x31]; // 'hev1'
+  let end = buf.length;
+  for (let i = 4; i + 4 <= buf.length; i++) {
+    if (buf[i] === 0x6d && buf[i + 1] === 0x64 && buf[i + 2] === 0x61 && buf[i + 3] === 0x74) {
+      end = i;
+      break;
+    }
+  }
+  end = Math.min(end, 1 << 20);
+  for (let i = 0; i + 4 <= end; i++) {
+    if (
+      buf[i] === needle[0] && buf[i + 1] === needle[1] &&
+      buf[i + 2] === needle[2] && buf[i + 3] === needle[3]
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Concatenate the downloaded segments and remux them (stream copy, no
 // re-encode) into a single standard faststart MP4 — the layout QuickTime and
 // other default players want, and it works for any codec (H.264, H.265, …).
-// Returns a Uint8Array, or null so the caller can fall back to a raw save.
+// Resolves to { data, codec, resolution } (codec/resolution best-effort from
+// the ffmpeg log), or null so the caller can fall back to a raw save.
 function remuxToMp4(parts, initData, isTs, onLog) {
   const run = async () => {
     const core = await getFfmpegCore();
@@ -219,30 +246,55 @@ function remuxToMp4(parts, initData, isTs, onLog) {
 
     const inName = isTs ? 'in.ts' : 'in.mp4';
     const outName = 'out.mp4';
-    try {
-      if (onLog && core.setLogger) core.setLogger((e) => onLog(e && e.message));
-      core.FS.writeFile(inName, input);
-      core.exec('-i', inName, '-c', 'copy', '-movflags', '+faststart', outName);
-      const code = core.ret;
-      let out = null;
-      if (code === 0) {
-        try {
-          out = core.FS.readFile(outName);
-        } catch (_) {
-          out = null;
-        }
+    const outName2 = 'out2.mp4';
+    let codec = null;
+    let resolution = null;
+    const onLogLine = (line) => {
+      if (!line) return;
+      // e.g. "Stream #0:0: Video: hevc (Main), yuv420p(tv), 1920x1080 ..."
+      const m = line.match(/Video:\s*(\w+).*?(\d{2,5}x\d{2,5})/);
+      if (m && !codec) {
+        codec = m[1];
+        resolution = m[2];
       }
+      if (onLog) onLog(line);
+    };
+
+    const execOnce = (...args) => {
+      core.exec(...args);
+      const code = core.ret;
+      if (core.reset) core.reset();
+      if (code !== 0) return null;
+      try {
+        return core.FS.readFile(args[args.length - 1]);
+      } catch (_) {
+        return null;
+      }
+    };
+
+    try {
+      if (core.setLogger) core.setLogger((e) => onLogLine(e && e.message));
+      core.FS.writeFile(inName, input);
+      let out = execOnce('-i', inName, '-c', 'copy', '-movflags', '+faststart', outName);
+
+      // Retag HEVC as hvc1 for Apple players. Stream copy again, so still fast.
+      if (out && hasHev1Tag(out)) {
+        const retagged = execOnce(
+          '-i', inName, '-c', 'copy', '-tag:v', 'hvc1', '-movflags', '+faststart', outName2
+        );
+        if (retagged) out = retagged;
+      }
+
       // Always clean the in-memory FS so big episodes don't accumulate.
-      for (const f of [inName, outName]) {
+      for (const f of [inName, outName, outName2]) {
         try {
           core.FS.unlink(f);
         } catch (_) {
           /* not there */
         }
       }
-      if (core.reset) core.reset();
-      // Copy out of wasm memory so it survives the reset.
-      return out && out.length ? new Uint8Array(out) : null;
+      // Copy out of wasm memory so it survives further use.
+      return out && out.length ? { data: new Uint8Array(out), codec, resolution } : null;
     } catch (e) {
       console.error('remux failed, falling back to raw save', e);
       try {
@@ -353,8 +405,9 @@ async function runJob(job) {
     let blob;
     let ext;
     if (mp4) {
-      blob = new Blob([mp4], { type: 'video/mp4' });
+      blob = new Blob([mp4.data], { type: 'video/mp4' });
       ext = '.mp4';
+      if (!quality && mp4.resolution) quality = mp4.resolution;
     } else if (isTs) {
       blob = new Blob(parts, { type: 'video/mp2t' });
       ext = '.ts';
@@ -365,9 +418,13 @@ async function runJob(job) {
     }
     const objectUrl = URL.createObjectURL(blob);
 
+    // Height (e.g. 1080p) in the filename helps tell look-alike files apart.
+    const heightMatch = (quality || '').match(/x(\d{3,4})/);
+    const qualityTag = heightMatch ? ' [' + heightMatch[1] + 'p]' : '';
+
     const downloadId = await chrome.downloads.download({
       url: objectUrl,
-      filename: job.filename + ext,
+      filename: job.filename + qualityTag + ext,
     });
 
     const onChanged = (delta) => {
