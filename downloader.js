@@ -173,6 +173,53 @@ function ivFor(segment) {
   return iv;
 }
 
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function startsWithPng(u8) {
+  if (u8.length < 8) return false;
+  for (let i = 0; i < 8; i++) if (u8[i] !== PNG_SIGNATURE[i]) return false;
+  return true;
+}
+
+// Some anti-download CDNs (miruro's "vault*.ultracloud.cc" among them) prepend
+// a decoy PNG image to every media segment; the site's own player strips it in
+// JS before playback. If we don't, ffmpeg sees a stream of 1x1 PNGs instead of
+// video and the "converted" file is unplayable. Walk the PNG chunk structure
+// (signature + chunks until IEND) and return the offset of the real media that
+// follows — 0 if this segment isn't PNG-wrapped.
+function pngPayloadOffset(u8) {
+  if (!startsWithPng(u8)) return 0;
+  let off = 8; // past the 8-byte signature
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  while (off + 8 <= u8.length) {
+    const len = dv.getUint32(off); // chunk data length (big-endian)
+    const type = String.fromCharCode(u8[off + 4], u8[off + 5], u8[off + 6], u8[off + 7]);
+    off += 8 + len + 4; // 4 len + 4 type + data + 4 CRC
+    if (type === 'IEND') return off <= u8.length ? off : 0;
+    if (off > u8.length) return 0; // malformed / truncated
+  }
+  return 0;
+}
+
+// Strip a decoy PNG wrapper if present; returns { data, stripped }.
+function deobfuscateSegment(buf) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const off = pngPayloadOffset(u8);
+  if (off > 0 && off < u8.length) {
+    return { data: u8.subarray(off), stripped: off };
+  }
+  return { data: u8, stripped: 0 };
+}
+
+function hexPreview(buf, n) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const out = [];
+  for (let i = 0; i < Math.min(n, u8.length); i++) {
+    out.push(u8[i].toString(16).padStart(2, '0'));
+  }
+  return out.join(' ');
+}
+
 async function fetchSegment(segment, signal) {
   const res = await fetch(segment.url, { signal });
   if (!res.ok) throw new Error('segment HTTP ' + res.status);
@@ -496,8 +543,15 @@ async function runJob(job, ctl, ui) {
       ui.status('Fetching init segment…');
       const initRes = await fetch(map, { signal });
       if (!initRes.ok) throw new Error('init segment HTTP ' + initRes.status);
-      initData = await initRes.arrayBuffer();
+      const rawInit = await initRes.arrayBuffer();
+      const de = deobfuscateSegment(rawInit);
+      if (de.stripped) log('init segment: stripped ' + de.stripped + '-byte PNG wrapper');
+      initData = de.data;
     }
+
+    // Track PNG-wrapper stripping across segments for one summary log line.
+    let strippedCount = 0;
+    let firstLogged = false;
 
     let doneCount = 0;
     let totalBytes = initData ? initData.byteLength : 0;
@@ -508,9 +562,10 @@ async function runJob(job, ctl, ui) {
         await ctl.gate(); // honour pause/cancel between segments
         const idx = cursor++;
         let attempt = 0;
+        let raw;
         for (;;) {
           try {
-            parts[idx] = await fetchSegment(segments[idx], signal);
+            raw = await fetchSegment(segments[idx], signal);
             break;
           } catch (e) {
             if (e && e.name === 'AbortError') throw e;
@@ -519,6 +574,13 @@ async function runJob(job, ctl, ui) {
             await new Promise((r) => setTimeout(r, 1000 * attempt));
           }
         }
+        if (idx === 0 && !firstLogged) {
+          firstLogged = true;
+          log('first segment starts: ' + hexPreview(raw, 16));
+        }
+        const de = deobfuscateSegment(raw);
+        if (de.stripped) strippedCount += 1;
+        parts[idx] = de.data;
         totalBytes += parts[idx].byteLength;
         doneCount += 1;
         ui.progress(doneCount / segments.length);
@@ -534,14 +596,21 @@ async function runJob(job, ctl, ui) {
     );
 
     ui.status('Converting to MP4…');
+    if (strippedCount) {
+      log('stripped decoy PNG wrapper from ' + strippedCount + '/' + segments.length + ' segments');
+    }
     // MPEG-TS segments start with sync byte 0x47; anything else (fMP4 .m4s) is
     // already an MP4-family stream. Either way, remux to a standard faststart
     // MP4 so it opens in QuickTime and every other default player, for any
     // codec. If ffmpeg.wasm isn't available or the remux fails, fall back to a
     // raw save (.ts plays in VLC) so a download is never lost.
-    const first = new Uint8Array(parts[0].slice(0, 4));
+    const first = new Uint8Array(parts[0].subarray ? parts[0].subarray(0, 4) : parts[0].slice(0, 4));
     const isTs = first[0] === 0x47;
-    log('container: ' + (isTs ? 'MPEG-TS' : 'fMP4/other') + ', downloaded ' + formatSize(totalBytes));
+    log(
+      'container: ' + (isTs ? 'MPEG-TS' : 'fMP4/other') +
+        ', post-strip starts: ' + hexPreview(parts[0], 12) +
+        ', downloaded ' + formatSize(totalBytes)
+    );
 
     const mp4 = await remuxToMp4(parts, initData, isTs, (line) => {
       log(line);

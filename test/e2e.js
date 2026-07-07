@@ -26,6 +26,36 @@ const REAL_SEGS = [REAL_TS.slice(0, REAL_SPLIT), REAL_TS.slice(REAL_SPLIT)];
 // codec-agnostic (this is the case that broke real downloads).
 const HEVC_TS = fs.readFileSync(path.join(__dirname, 'fixtures', 'hevc.ts'));
 
+// A real 1x1 RGBA PNG, the decoy some anti-download CDNs prepend to every
+// segment (miruro's vault*.ultracloud.cc). PNG-wrapped segments below verify
+// the extension strips it before converting.
+const zlib = require('zlib');
+function pngChunk(type, data) {
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  let c = ~0;
+  for (let i = 0; i < body.length; i++) {
+    c ^= body[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE((~c) >>> 0);
+  return Buffer.concat([len, body, crc]);
+}
+const DECOY_PNG = (() => {
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(1, 0);
+  ihdr.writeUInt32BE(1, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6; // 8-bit RGBA
+  const idat = zlib.deflateSync(Buffer.from([0x00, 0xff, 0x00, 0x00, 0xff]));
+  return Buffer.concat([sig, pngChunk('IHDR', ihdr), pngChunk('IDAT', idat), pngChunk('IEND', Buffer.alloc(0))]);
+})();
+// Each PNG-wrapped segment = decoy PNG + a real H.264 TS half.
+const PNG_SEGS = REAL_SEGS.map((s) => Buffer.concat([DECOY_PNG, s]));
+
 const crypto = require('crypto');
 const AES_KEY = crypto.randomBytes(16);
 function encryptSegment(i) {
@@ -98,6 +128,16 @@ const server = http.createServer((req, res) => {
     const i = parseInt(u.pathname.match(/\d+/)[0], 10);
     res.setHeader('content-type', 'video/mp2t');
     setTimeout(() => res.end(segments[i % SEG_COUNT]), 800);
+  } else if (u.pathname === '/png.m3u8') {
+    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+    res.end(
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n' +
+        '#EXTINF:1.0,\npng-seg0.ts\n#EXTINF:1.0,\npng-seg1.ts\n#EXT-X-ENDLIST\n'
+    );
+  } else if (/^\/png-seg[01]\.ts$/.test(u.pathname)) {
+    const i = parseInt(u.pathname.match(/[01]/)[0], 10);
+    res.setHeader('content-type', 'video/mp2t');
+    res.end(PNG_SEGS[i]);
   } else if (u.pathname === '/hevc.m3u8') {
     res.setHeader('content-type', 'application/vnd.apple.mpegurl');
     res.end(
@@ -396,6 +436,24 @@ const server = http.createServer((req, res) => {
   if (!hevcMoovRegion.includes(Buffer.from('hvc1')))
     throw new Error('FAIL: HEVC not tagged hvc1');
   console.log('PASS: H.265/HEVC MPEG-TS remuxed to standard MP4 with hvc1 tag');
+
+  // 8b. PNG-wrapped segments (miruro/ultracloud anti-download decoy): each
+  // segment is a 1x1 PNG followed by the real TS. Without stripping, ffmpeg
+  // sees png_pipe and the file is unplayable — this is exactly what broke the
+  // user's downloads. Assert the wrapper is stripped and the result is a
+  // proper H.264 MP4.
+  const pngMp4 = await runRemuxJob(
+    { url: base + '/png.m3u8', kind: 'hls', pageUrl: base + '/watch.html', title: 'PNG Wrapped' },
+    5,
+    'PNG-wrapped'
+  );
+  assertStandardMp4(pngMp4, 'PNG-wrapped');
+  const pngLog = await dlPage.evaluate(() => document.querySelector('.job pre.log').textContent);
+  if (!/stripped decoy PNG wrapper from 2\/2 segments/.test(pngLog))
+    throw new Error('FAIL: PNG wrapper not stripped per log:\n' + pngLog.slice(0, 800));
+  if (/png_pipe/.test(pngLog))
+    throw new Error('FAIL: ffmpeg still saw png_pipe (strip failed)');
+  console.log('PASS: decoy PNG wrapper stripped, segments converted to real MP4');
 
   // 9. Cancel: start a deliberately slow stream, hit its Cancel button, and
   // confirm the row flips to Cancelled and no new download lands.

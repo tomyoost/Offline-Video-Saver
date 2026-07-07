@@ -80,6 +80,13 @@ and mobile), which is a great pick for offline watching anyway.
   stream in an unusual way — open an issue with the site and it can likely be
   supported.
 
+### Anti-download tricks it handles
+
+Some CDNs (e.g. miruro's `vault*.ultracloud.cc`) prepend a decoy 1×1 PNG
+image to every video segment so naive downloaders save unplayable files; the
+extension detects and strips this wrapper automatically. Standard AES-128
+(non-DRM) encryption is also decrypted transparently.
+
 ## How it works (for the curious)
 
 - `background.js` — service worker; watches network responses via
