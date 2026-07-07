@@ -1,0 +1,78 @@
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  color: #1a1a1a;
+  background: #f6f7f9;
+}
+
+header {
+  padding: 18px 24px 10px;
+}
+
+h1 { font-size: 20px; margin: 0 0 6px; }
+
+.hint { color: #6b7280; font-size: 13px; margin: 0; max-width: 640px; }
+.hint code { background: #e5e7eb; padding: 1px 4px; border-radius: 4px; }
+.hint a { color: #2563eb; }
+
+#jobs { padding: 10px 24px 30px; max-width: 760px; }
+
+.job {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+
+.job .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.job .name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job .status { color: #6b7280; font-size: 12px; flex-shrink: 0; }
+.job.error .status { color: #dc2626; }
+.job.done .status { color: #15803d; font-weight: 600; }
+
+.bar {
+  margin-top: 10px;
+  height: 8px;
+  border-radius: 4px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+
+.bar > div {
+  height: 100%;
+  width: 0%;
+  background: #2563eb;
+  border-radius: 4px;
+  transition: width .3s;
+}
+
+.job.done .bar > div { background: #16a34a; }
+.job.error .bar > div { background: #dc2626; }
+
+.empty {
+  padding: 30px 24px;
+  color: #6b7280;
+}
+
+@media (prefers-color-scheme: dark) {
+  body { background: #101216; color: #e7e9ee; }
+  .job { background: #191c22; border-color: #262b34; }
+  .hint { color: #9aa2b1; }
+  .hint code { background: #262b34; }
+  .bar { background: #262b34; }
+  .empty { color: #9aa2b1; }
+}

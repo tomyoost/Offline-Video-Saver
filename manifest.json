@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Offline Video Saver",
+  "version": "1.0.0",
+  "description": "Detects videos (MP4/WebM/HLS) on the page you're watching and saves them for offline viewing. No limits, no premium.",
+  "permissions": [
+    "webRequest",
+    "webNavigation",
+    "downloads",
+    "storage",
+    "declarativeNetRequest",
+    "tabs"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Offline Video Saver"
+  }
+}
